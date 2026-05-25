@@ -1,5 +1,5 @@
-use std::io::{self, BufRead, Write};
 use serde_json::{json, Value};
+use std::io::{self, BufRead, Write};
 
 pub struct Node {
     pub id: String,
@@ -20,7 +20,11 @@ impl Node {
         let stdin = io::stdin();
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        let mut node = Node { id: String::new(), node_ids: vec![], msg_id: 0 };
+        let mut node = Node {
+            id: String::new(),
+            node_ids: vec![],
+            msg_id: 0,
+        };
 
         for line in stdin.lock().lines() {
             let line = line.expect("failed to read line");
@@ -39,7 +43,11 @@ impl Node {
                 node.id = body["node_id"].as_str().unwrap_or("").to_string();
                 node.node_ids = body["node_ids"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
                     .unwrap_or_default();
                 log::info!("initialized as {}", node.id);
                 Some(json!({ "type": "init_ok" }))

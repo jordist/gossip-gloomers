@@ -6,24 +6,31 @@ fn main() {
     let mut seen_messages = HashSet::new();
     let mut my_neighbors = Vec::new();
 
-    Node::run(|node: &mut flyio::Node, msg_type, body: &serde_json::Value| match msg_type {
-        "broadcast" => {
-            let message = &body["message"];
-            seen_messages.insert(message.clone());
-            // TODO: Actually broadcast
-            Some(json!({ "type": "broadcast_ok"}))
-        }
-        "read" => {
-            let messages_arr = seen_messages.iter().cloned().collect::<Vec<_>>();
-            Some(json!({"type":"read_ok", "messages": messages_arr}))
-        }
-        "topology" => {
-            my_neighbors = body["topology"].as_object().unwrap()[node.id.as_str()].as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect();
-            Some(json!({"type": "topology_ok"}))
-        }
-        other => {
-            log::warn!("unknown message type: {other}");
-            None
-        }
-    });
+    Node::run(
+        |node: &mut flyio::Node, msg_type, body: &serde_json::Value| match msg_type {
+            "broadcast" => {
+                let message = &body["message"];
+                seen_messages.insert(message.clone());
+                // TODO: Actually broadcast
+                Some(json!({ "type": "broadcast_ok"}))
+            }
+            "read" => {
+                let messages_arr = seen_messages.iter().cloned().collect::<Vec<_>>();
+                Some(json!({"type":"read_ok", "messages": messages_arr}))
+            }
+            "topology" => {
+                my_neighbors = body["topology"].as_object().unwrap()[node.id.as_str()]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| x.as_str().unwrap().to_string())
+                    .collect();
+                Some(json!({"type": "topology_ok"}))
+            }
+            other => {
+                log::warn!("unknown message type: {other}");
+                None
+            }
+        },
+    );
 }
