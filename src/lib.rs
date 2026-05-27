@@ -1,68 +1,126 @@
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use std::sync::mpsc;
+use std::time::Duration;
 
 pub struct Node {
     pub id: String,
     pub node_ids: Vec<String>,
     msg_id: u64,
+    out: io::Stdout,
 }
 
 impl Node {
-    pub fn run<F>(mut handler: F)
-    where
-        F: FnMut(&mut Node, &str, &Value) -> Option<Value>,
-    {
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    pub fn next_msg_id(&mut self) -> u64 {
+        self.msg_id += 1;
+        self.msg_id
+    }
+
+    pub fn send(&mut self, dest: &str, body: Value) {
+        let mut body = body;
+        body["msg_id"] = json!(self.next_msg_id());
+        let msg = json!({ "src": self.id, "dest": dest, "body": body });
+        let s = serde_json::to_string(&msg).unwrap();
+        log::info!("send: {s}");
+        let mut out = self.out.lock();
+        writeln!(out, "{s}").expect("failed to write");
+        out.flush().expect("failed to flush");
+    }
+
+    fn init_logger() {
         env_logger::Builder::new()
             .target(env_logger::Target::Stderr)
             .filter_level(log::LevelFilter::Info)
             .init();
+    }
 
-        let stdin = io::stdin();
-        let stdout = io::stdout();
-        let mut out = stdout.lock();
-        let mut node = Node {
-            id: String::new(),
-            node_ids: vec![],
-            msg_id: 0,
+    /// Moves stdin onto a background thread and returns the receiving end of a
+    /// channel so the main loop can read lines without blocking indefinitely.
+    fn spawn_stdin_reader() -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in io::stdin().lock().lines() {
+                if tx.send(line.expect("failed to read line")).is_err() {
+                    break; // main thread dropped the receiver
+                }
+            }
+        });
+        rx
+    }
+
+    fn new() -> Self {
+        Node { id: String::new(), node_ids: vec![], msg_id: 0, out: io::stdout() }
+    }
+
+    fn process_message<F>(&mut self, line: String, handler: &mut F)
+    where
+        F: FnMut(&mut Node, &str, &Value) -> Option<Value>,
+    {
+        log::info!("recv: {line}");
+        let msg: Value = serde_json::from_str(&line).expect("invalid JSON");
+        let src = msg["src"].as_str().unwrap_or("").to_string();
+        let body = &msg["body"];
+        let msg_type = body["type"].as_str().unwrap_or("");
+        let in_reply_to = body["msg_id"].clone();
+
+        let reply_body = if msg_type == "init" {
+            self.id = body["node_id"].as_str().unwrap_or("").to_string();
+            self.node_ids = body["node_ids"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            log::info!("initialized as {}", self.id);
+            Some(json!({ "type": "init_ok" }))
+        } else {
+            handler(self, msg_type, body)
         };
 
-        for line in stdin.lock().lines() {
-            let line = line.expect("failed to read line");
-            log::info!("recv: {line}");
+        if let Some(mut rb) = reply_body {
+            rb["in_reply_to"] = in_reply_to;
+            self.send(&src, rb);
+        }
+    }
 
-            let msg: Value = serde_json::from_str(&line).expect("invalid JSON");
-            let src = msg["src"].as_str().unwrap_or("").to_string();
-            let dest = msg["dest"].as_str().unwrap_or("").to_string();
-            let body = &msg["body"];
-            let msg_type = body["type"].as_str().unwrap_or("");
-            let in_reply_to = body["msg_id"].clone();
+    // ── entry points ─────────────────────────────────────────────────────────
 
-            node.msg_id += 1;
+    pub fn run<F>(mut handler: F)
+    where
+        F: FnMut(&mut Node, &str, &Value) -> Option<Value>,
+    {
+        Self::init_logger();
+        let rx = Self::spawn_stdin_reader();
+        let mut node = Self::new();
 
-            let reply_body = if msg_type == "init" {
-                node.id = body["node_id"].as_str().unwrap_or("").to_string();
-                node.node_ids = body["node_ids"]
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                log::info!("initialized as {}", node.id);
-                Some(json!({ "type": "init_ok" }))
-            } else {
-                handler(&mut node, msg_type, body)
-            };
+        loop {
+            match rx.recv() {
+                Ok(line) => node.process_message(line, &mut handler),
+                Err(_) => break, // stdin closed
+            }
+        }
+    }
 
-            if let Some(mut rb) = reply_body {
-                rb["msg_id"] = json!(node.msg_id);
-                rb["in_reply_to"] = in_reply_to;
-                let reply = json!({ "src": dest, "dest": src, "body": rb });
-                let reply_str = serde_json::to_string(&reply).unwrap();
-                log::info!("send: {reply_str}");
-                writeln!(out, "{reply_str}").expect("failed to write");
-                out.flush().expect("failed to flush");
+    /// Like `run`, but also fires `on_tick` every `interval` when no message
+    /// arrives. Use this to implement retries, gossip sweeps, etc.
+    pub fn run_with_tick<F, T>(mut handler: F, interval: Duration, mut on_tick: T)
+    where
+        F: FnMut(&mut Node, &str, &Value) -> Option<Value>,
+        T: FnMut(&mut Node),
+    {
+        Self::init_logger();
+        let rx = Self::spawn_stdin_reader();
+        let mut node = Self::new();
+
+        loop {
+            match rx.recv_timeout(interval) {
+                Ok(line) => node.process_message(line, &mut handler),
+                Err(mpsc::RecvTimeoutError::Timeout) => on_tick(&mut node),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     }
