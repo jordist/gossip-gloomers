@@ -3,7 +3,7 @@ use serde_json::json;
 
 fn main() {
     let mut counter = 0;
-    Node::run(|node: &mut flyio::Node, msg_type, _body| match msg_type {
+    Node::run(|node, msg| match msg.msg_type {
         "generate" => {
             let unique_id = format!("{}-{}", node.id, counter);
             counter += 1;

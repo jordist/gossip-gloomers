@@ -13,12 +13,12 @@ fn main() {
     let mut my_neighbors = Vec::new();
 
     Node::run(
-        |node: &mut flyio::Node, msg_type, body: &serde_json::Value| match msg_type {
+        |node: &mut flyio::Node, msg| match msg.msg_type {
             "broadcast" => {
-                let message = &body["message"];
-                let inserted = seen_messages.insert(message.clone());
+                let body = &msg.body["message"];
+                let inserted = seen_messages.insert(body.clone());
                 if inserted {
-                    broadcast_to_neighbors(node, &my_neighbors, message);
+                    broadcast_to_neighbors(node, &my_neighbors, body);
                 }
                 Some(json!({ "type": "broadcast_ok"}))
             }
@@ -27,7 +27,7 @@ fn main() {
                 Some(json!({"type":"read_ok", "messages": messages_arr}))
             }
             "topology" => {
-                my_neighbors = body["topology"].as_object().unwrap()[node.id.as_str()]
+                my_neighbors = msg.body["topology"].as_object().unwrap()[node.id.as_str()]
                     .as_array()
                     .unwrap()
                     .iter()

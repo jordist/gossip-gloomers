@@ -3,6 +3,12 @@ use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
 use std::time::Duration;
 
+pub struct Message<'a> {
+    pub src: &'a str,
+    pub msg_type: &'a str,
+    pub body: &'a Value,
+}
+
 pub struct Node {
     pub id: String,
     pub node_ids: Vec<String>,
@@ -18,15 +24,17 @@ impl Node {
         self.msg_id
     }
 
-    pub fn send(&mut self, dest: &str, body: Value) {
+    pub fn send(&mut self, dest: &str, body: Value) -> u64 {
         let mut body = body;
-        body["msg_id"] = json!(self.next_msg_id());
+        let id = self.next_msg_id();
+        body["msg_id"] = json!(id);
         let msg = json!({ "src": self.id, "dest": dest, "body": body });
         let s = serde_json::to_string(&msg).unwrap();
         log::info!("send: {s}");
         let mut out = self.out.lock();
         writeln!(out, "{s}").expect("failed to write");
         out.flush().expect("failed to flush");
+        id
     }
 
     fn init_logger() {
@@ -56,7 +64,7 @@ impl Node {
 
     fn process_message<F>(&mut self, line: String, handler: &mut F)
     where
-        F: FnMut(&mut Node, &str, &Value) -> Option<Value>,
+        F: FnMut(&mut Node, &Message) -> Option<Value>,
     {
         log::info!("recv: {line}");
         let msg: Value = serde_json::from_str(&line).expect("invalid JSON");
@@ -78,7 +86,7 @@ impl Node {
             log::info!("initialized as {}", self.id);
             Some(json!({ "type": "init_ok" }))
         } else {
-            handler(self, msg_type, body)
+            handler(self, &Message { src: &src, msg_type, body })
         };
 
         if let Some(mut rb) = reply_body {
@@ -91,7 +99,7 @@ impl Node {
 
     pub fn run<F>(mut handler: F)
     where
-        F: FnMut(&mut Node, &str, &Value) -> Option<Value>,
+        F: FnMut(&mut Node, &Message) -> Option<Value>,
     {
         Self::init_logger();
         let rx = Self::spawn_stdin_reader();
@@ -105,23 +113,24 @@ impl Node {
         }
     }
 
-    /// Like `run`, but also fires `on_tick` every `interval` when no message
-    /// arrives. Use this to implement retries, gossip sweeps, etc.
-    pub fn run_with_tick<F, T>(mut handler: F, interval: Duration, mut on_tick: T)
-    where
-        F: FnMut(&mut Node, &str, &Value) -> Option<Value>,
-        T: FnMut(&mut Node),
-    {
+    /// Like `run`, but also fires `handler.tick()` every `interval` when no
+    /// message arrives. Use this to implement retries, gossip sweeps, etc.
+    pub fn run_with_tick<H: NodeHandler>(mut handler: H, interval: Duration) {
         Self::init_logger();
         let rx = Self::spawn_stdin_reader();
         let mut node = Self::new();
 
         loop {
             match rx.recv_timeout(interval) {
-                Ok(line) => node.process_message(line, &mut handler),
-                Err(mpsc::RecvTimeoutError::Timeout) => on_tick(&mut node),
+                Ok(line) => node.process_message(line, &mut |n, m| handler.handle(n, m)),
+                Err(mpsc::RecvTimeoutError::Timeout) => handler.tick(&mut node),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     }
+}
+
+pub trait NodeHandler {
+    fn handle(&mut self, node: &mut Node, msg: &Message) -> Option<Value>;
+    fn tick(&mut self, node: &mut Node);
 }
