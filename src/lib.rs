@@ -59,7 +59,12 @@ impl Node {
     }
 
     fn new() -> Self {
-        Node { id: String::new(), node_ids: vec![], msg_id: 0, out: io::stdout() }
+        Node {
+            id: String::new(),
+            node_ids: vec![],
+            msg_id: 0,
+            out: io::stdout(),
+        }
     }
 
     fn process_message<F>(&mut self, line: String, handler: &mut F)
@@ -86,7 +91,14 @@ impl Node {
             log::info!("initialized as {}", self.id);
             Some(json!({ "type": "init_ok" }))
         } else {
-            handler(self, &Message { src: &src, msg_type, body })
+            handler(
+                self,
+                &Message {
+                    src: &src,
+                    msg_type,
+                    body,
+                },
+            )
         };
 
         if let Some(mut rb) = reply_body {

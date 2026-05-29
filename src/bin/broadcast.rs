@@ -1,6 +1,9 @@
 use flyio::{Node, NodeHandler};
 use serde_json::json;
-use std::{collections::{HashMap, HashSet}, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -23,7 +26,12 @@ impl Broadcaster {
         }
     }
 
-    fn broadcast(&mut self, node: &mut flyio::Node, message: &serde_json::Value, except: Option<&str>) {
+    fn broadcast(
+        &mut self,
+        node: &mut flyio::Node,
+        message: &serde_json::Value,
+        except: Option<&str>,
+    ) {
         for neighbor in &self.my_neighbors {
             if let Some(except_id) = except {
                 if neighbor == except_id {
@@ -31,7 +39,14 @@ impl Broadcaster {
                 }
             }
             let id = node.send(neighbor, json!({ "type": "broadcast", "message": message }));
-            self.pending_acks.insert(id, BroadcastItem { message: message.clone(), destination: neighbor.clone(), sent_time: std::time::Instant::now() });
+            self.pending_acks.insert(
+                id,
+                BroadcastItem {
+                    message: message.clone(),
+                    destination: neighbor.clone(),
+                    sent_time: std::time::Instant::now(),
+                },
+            );
         }
     }
 
@@ -40,7 +55,8 @@ impl Broadcaster {
     }
 
     fn tick(&mut self, node: &mut flyio::Node) {
-        let to_retry: Vec<(u64, serde_json::Value, String)> = self.pending_acks
+        let to_retry: Vec<(u64, serde_json::Value, String)> = self
+            .pending_acks
             .iter()
             .filter(|(_, item)| item.sent_time.elapsed() > BROADCAST_TIMEOUT)
             .map(|(id, item)| (*id, item.message.clone(), item.destination.clone()))
@@ -48,9 +64,19 @@ impl Broadcaster {
 
         for (old_id, message, destination) in to_retry {
             log::info!("Retrying broadcast id={old_id} to {destination}: {message}");
-            let new_id = node.send(&destination, json!({ "type": "broadcast", "message": message }));
+            let new_id = node.send(
+                &destination,
+                json!({ "type": "broadcast", "message": message }),
+            );
             self.pending_acks.remove(&old_id);
-            self.pending_acks.insert(new_id, BroadcastItem { message, destination, sent_time: std::time::Instant::now() });
+            self.pending_acks.insert(
+                new_id,
+                BroadcastItem {
+                    message,
+                    destination,
+                    sent_time: std::time::Instant::now(),
+                },
+            );
         }
     }
 }
@@ -76,7 +102,10 @@ impl NodeHandler for BroadcastHandler {
                 let body = &msg.body["message"];
                 let inserted = self.seen_messages.insert(body.clone());
                 if inserted {
-                    self.broadcaster.as_mut().unwrap().broadcast(node, body, Some(msg.src));
+                    self.broadcaster
+                        .as_mut()
+                        .unwrap()
+                        .broadcast(node, body, Some(msg.src));
                 }
                 Some(json!({ "type": "broadcast_ok" }))
             }
@@ -85,12 +114,13 @@ impl NodeHandler for BroadcastHandler {
                 Some(json!({ "type": "read_ok", "messages": messages_arr }))
             }
             "topology" => {
-                let neighbors: Vec<String> = msg.body["topology"].as_object().unwrap()[node.id.as_str()]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|x| x.as_str().unwrap().to_string())
-                    .collect();
+                let neighbors: Vec<String> = msg.body["topology"].as_object().unwrap()
+                    [node.id.as_str()]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect();
                 self.broadcaster = Some(Broadcaster::new(&neighbors));
                 Some(json!({ "type": "topology_ok" }))
             }
