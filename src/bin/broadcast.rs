@@ -1,9 +1,11 @@
-use flyio::{Node, NodeHandler};
-use serde_json::json;
+use flyio::{Message, Node};
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
+    sync::Arc,
     time::Duration,
 };
+use tokio::sync::Mutex;
 
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(1);
 const POLICY: PolicyKind = PolicyKind::Group;
@@ -12,7 +14,7 @@ const GROUP_SIZE: usize = 5; // members per group for GroupPolicy
 // Computes the next hops for a broadcast message based on the incoming metadata.
 // Returns a list of (destination, metadata) pairs to forward to. The metadata is opaque to the
 // broadcaster.
-trait ForwardPolicy {
+trait ForwardPolicy: Send {
     fn next_hops(&self, incoming_meta: &serde_json::Value) -> Vec<(String, serde_json::Value)>;
 }
 
@@ -53,12 +55,16 @@ struct DirectPolicy {
 
 impl DirectPolicy {
     fn new(topology: &HashMap<String, Vec<String>>, node_id: &str) -> Self {
-        let mut all_others: Vec<String> = topology.keys()
+        let mut all_others: Vec<String> = topology
+            .keys()
             .filter(|n| n.as_str() != node_id)
             .cloned()
             .collect();
         all_others.sort();
-        Self { node_id: node_id.to_string(), all_others }
+        Self {
+            node_id: node_id.to_string(),
+            all_others,
+        }
     }
 }
 
@@ -69,7 +75,8 @@ impl ForwardPolicy for DirectPolicy {
             vec![]
         } else {
             // First receipt from a client (meta = null): blast to all.
-            self.all_others.iter()
+            self.all_others
+                .iter()
                 .map(|n| (n.clone(), json!(self.node_id)))
                 .collect()
         }
@@ -82,7 +89,6 @@ impl ForwardPolicy for DirectPolicy {
 // forwards to its own group ("intra") and to one representative per other group ("inter").
 // Representatives forward to their group ("intra"). Intra-receivers do not forward.
 struct GroupPolicy {
-    node_id: String,
     group_members: Vec<String>,    // other nodes in our group
     other_group_reps: Vec<String>, // first node of every other group
 }
@@ -111,7 +117,10 @@ impl GroupPolicy {
             .map(|start| nodes[start].to_string())
             .collect();
 
-        Self { node_id: node_id.to_string(), group_members, other_group_reps }
+        Self {
+            group_members,
+            other_group_reps,
+        }
     }
 }
 
@@ -119,15 +128,23 @@ impl ForwardPolicy for GroupPolicy {
     fn next_hops(&self, incoming_meta: &serde_json::Value) -> Vec<(String, serde_json::Value)> {
         match incoming_meta.as_str() {
             Some("intra") => vec![],
-            Some("inter") => self.group_members.iter()
+            Some("inter") => self
+                .group_members
+                .iter()
                 .map(|n| (n.clone(), json!("intra")))
                 .collect(),
             _ => {
                 // entry point: fan out to own group and one rep per other group
-                let mut hops: Vec<(String, serde_json::Value)> = self.group_members.iter()
+                let mut hops: Vec<(String, serde_json::Value)> = self
+                    .group_members
+                    .iter()
                     .map(|n| (n.clone(), json!("intra")))
                     .collect();
-                hops.extend(self.other_group_reps.iter().map(|n| (n.clone(), json!("inter"))));
+                hops.extend(
+                    self.other_group_reps
+                        .iter()
+                        .map(|n| (n.clone(), json!("inter"))),
+                );
                 hops
             }
         }
@@ -137,6 +154,7 @@ impl ForwardPolicy for GroupPolicy {
 // ---------------------------------------------------------------------------
 // Policy factory:
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 enum PolicyKind {
     Simple,
     Direct,
@@ -159,159 +177,88 @@ fn make_policy(
 }
 
 // ---------------------------------------------------------------------------
-// Broadcaster machinery
-struct BroadcastItem {
-    message: serde_json::Value,
-    destination: String,
-    sent_time: std::time::Instant,
-    meta: serde_json::Value,
+// Node state
+struct NodeState {
+    seen_messages: HashSet<Value>,
+    policy: Option<Box<dyn ForwardPolicy>>,
 }
 
-struct Broadcaster {
-    policy: Box<dyn ForwardPolicy>,
-    pending_acks: HashMap<u64, BroadcastItem>,
-}
-
-impl Broadcaster {
-    fn new(policy: Box<dyn ForwardPolicy>) -> Self {
-        Self {
-            policy,
-            pending_acks: HashMap::new(),
-        }
-    }
-
-    fn broadcast(
-        &mut self,
-        node: &mut flyio::Node,
-        message: &serde_json::Value,
-        incoming_meta: &serde_json::Value,
-    ) {
-        for (dest, meta) in self.policy.next_hops(incoming_meta) {
-            let id = node.send(
-                &dest,
-                json!({ "type": "broadcast", "message": message, "meta": meta }),
-            );
-            self.pending_acks.insert(
-                id,
-                BroadcastItem {
-                    message: message.clone(),
-                    destination: dest,
-                    sent_time: std::time::Instant::now(),
-                    meta,
-                },
-            );
-        }
-    }
-
-    fn handle_ack(&mut self, id: u64) {
-        self.pending_acks.remove(&id);
-    }
-
-    fn tick(&mut self, node: &mut flyio::Node) {
-        let to_retry: Vec<(u64, serde_json::Value, String, serde_json::Value)> = self
-            .pending_acks
-            .iter()
-            .filter(|(_, item)| item.sent_time.elapsed() > BROADCAST_TIMEOUT)
-            .map(|(id, item)| {
-                (
-                    *id,
-                    item.message.clone(),
-                    item.destination.clone(),
-                    item.meta.clone(),
-                )
-            })
-            .collect();
-
-        for (old_id, message, destination, meta) in to_retry {
-            let new_id = node.send(
-                &destination,
-                json!({ "type": "broadcast", "message": message, "meta": meta }),
-            );
-            self.pending_acks.remove(&old_id);
-            self.pending_acks.insert(
-                new_id,
-                BroadcastItem {
-                    message,
-                    destination,
-                    sent_time: std::time::Instant::now(),
-                    meta,
-                },
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Server handler:
-struct BroadcastHandler {
-    seen_messages: HashSet<serde_json::Value>,
-    broadcaster: Option<Broadcaster>,
-}
-
-impl BroadcastHandler {
+impl NodeState {
     fn new() -> Self {
         Self {
             seen_messages: HashSet::new(),
-            broadcaster: None,
+            policy: None,
         }
     }
 }
 
-impl NodeHandler for BroadcastHandler {
-    fn handle(&mut self, node: &mut Node, msg: &flyio::Message) -> Option<serde_json::Value> {
-        match msg.msg_type {
-            "broadcast" => {
-                let body = &msg.body["message"];
-                let inserted = self.seen_messages.insert(body.clone());
-                if inserted {
-                    self.broadcaster
-                        .as_mut()
-                        .unwrap()
-                        .broadcast(node, body, &msg.body["meta"]);
+// Forwards a message to `dest`
+fn forward(node: Node, message: Value, dest: String, meta: Value) {
+    tokio::spawn(async move {
+        let body = json!({ "type": "broadcast", "message": message, "meta": meta });
+        while node
+            .rpc_timeout(&dest, body.clone(), BROADCAST_TIMEOUT)
+            .await
+            .is_none()
+        {}
+    });
+}
+
+async fn handle(node: Node, msg: Message, state: Arc<Mutex<NodeState>>) -> Option<Value> {
+    let body = msg.body;
+    match msg.msg_type.as_str() {
+        "broadcast" => {
+            let message = body["message"].clone();
+            let meta = body["meta"].clone();
+            let hops = {
+                let mut state = state.lock().await;
+                if state.seen_messages.insert(message.clone()) {
+                    state
+                        .policy
+                        .as_ref()
+                        .map(|p| p.next_hops(&meta))
+                        .unwrap_or_default()
+                } else {
+                    vec![]
                 }
-                Some(json!({ "type": "broadcast_ok" }))
+            };
+            for (dest, hop_meta) in hops {
+                forward(node.clone(), message.clone(), dest, hop_meta);
             }
-            "read" => {
-                let messages: Vec<_> = self.seen_messages.iter().cloned().collect();
-                Some(json!({ "type": "read_ok", "messages": messages }))
-            }
-            "topology" => {
-                let topology: HashMap<String, Vec<String>> = msg.body["topology"]
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, v)| {
-                        let neighbors = v
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|x| x.as_str().unwrap().to_string())
-                            .collect();
-                        (k.clone(), neighbors)
-                    })
-                    .collect();
-                self.broadcaster = Some(Broadcaster::new(make_policy(POLICY, &topology, &node.id)));
-                Some(json!({ "type": "topology_ok" }))
-            }
-            "broadcast_ok" => {
-                let id = msg.body["in_reply_to"].as_u64().unwrap();
-                self.broadcaster.as_mut().unwrap().handle_ack(id);
-                None
-            }
-            other => {
-                log::warn!("unknown message type: {other}");
-                None
-            }
+            Some(json!({ "type": "broadcast_ok" }))
         }
-    }
-
-    fn tick(&mut self, node: &mut Node) {
-        if let Some(b) = self.broadcaster.as_mut() {
-            b.tick(node);
+        "read" => {
+            let messages: Vec<_> = state.lock().await.seen_messages.iter().cloned().collect();
+            Some(json!({ "type": "read_ok", "messages": messages }))
+        }
+        "topology" => {
+            let topology: HashMap<String, Vec<String>> = body["topology"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| {
+                    let neighbors = v
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_str().unwrap().to_string())
+                        .collect();
+                    (k.clone(), neighbors)
+                })
+                .collect();
+            let node_id = node.id().await;
+            state.lock().await.policy = Some(make_policy(POLICY, &topology, &node_id));
+            Some(json!({ "type": "topology_ok" }))
+        }
+        other => {
+            log::warn!("unknown message type: {other}");
+            None
         }
     }
 }
 
-fn main() {
-    Node::run_with_tick(BroadcastHandler::new(), Duration::from_millis(100));
+#[tokio::main]
+async fn main() {
+    let state = Arc::new(Mutex::new(NodeState::new()));
+    Node::run(move |node, msg| handle(node, msg, state.clone())).await;
 }
