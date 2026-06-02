@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(1);
 const POLICY: PolicyKind = PolicyKind::Group;
+const EXECUTOR: BroadcastExecutorKind = BroadcastExecutorKind::Immediate;
 const GROUP_SIZE: usize = 5; // members per group for GroupPolicy
 
 // Computes the next hops for a broadcast message based on the incoming metadata.
@@ -177,6 +178,49 @@ fn make_policy(
 }
 
 // ---------------------------------------------------------------------------
+// Broadcast executor: decides how forwarded hops are actually put on the wire.
+// `dispatch` is called once per (dest, meta) hop. An executor may send each hop
+// immediately or accumulate hops and flush them together later.
+trait BroadcastExecutor: Send + Sync {
+    fn dispatch(&self, node: &Node, message: Value, dest: String, meta: Value);
+}
+
+// ---------------------------------------------------------------------------
+// Immediate executor. Each hop is sent right away as its own broadcast RPC,
+// retried until acknowledged.
+struct ImmediateExecutor;
+
+impl BroadcastExecutor for ImmediateExecutor {
+    fn dispatch(&self, node: &Node, message: Value, dest: String, meta: Value) {
+        let node = node.clone();
+        tokio::spawn(async move {
+            let body = json!({ "type": "broadcast", "message": message, "meta": meta });
+            while node
+                .rpc_timeout(&dest, body.clone(), BROADCAST_TIMEOUT)
+                .await
+                .is_none()
+            {}
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast executor factory:
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+enum BroadcastExecutorKind {
+    Immediate,
+    Batched,
+}
+
+fn make_executor(kind: BroadcastExecutorKind) -> Arc<dyn BroadcastExecutor> {
+    match kind {
+        BroadcastExecutorKind::Immediate => Arc::new(ImmediateExecutor),
+        BroadcastExecutorKind::Batched => todo!("batched executor"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Node state
 struct NodeState {
     seen_messages: HashSet<Value>,
@@ -192,19 +236,12 @@ impl NodeState {
     }
 }
 
-// Forwards a message to `dest`
-fn forward(node: Node, message: Value, dest: String, meta: Value) {
-    tokio::spawn(async move {
-        let body = json!({ "type": "broadcast", "message": message, "meta": meta });
-        while node
-            .rpc_timeout(&dest, body.clone(), BROADCAST_TIMEOUT)
-            .await
-            .is_none()
-        {}
-    });
-}
-
-async fn handle(node: Node, msg: Message, state: Arc<Mutex<NodeState>>) -> Option<Value> {
+async fn handle(
+    node: Node,
+    msg: Message,
+    state: Arc<Mutex<NodeState>>,
+    broadcast_executor: Arc<dyn BroadcastExecutor>,
+) -> Option<Value> {
     let body = msg.body;
     match msg.msg_type.as_str() {
         "broadcast" => {
@@ -223,7 +260,7 @@ async fn handle(node: Node, msg: Message, state: Arc<Mutex<NodeState>>) -> Optio
                 }
             };
             for (dest, hop_meta) in hops {
-                forward(node.clone(), message.clone(), dest, hop_meta);
+                broadcast_executor.dispatch(&node, message.clone(), dest, hop_meta);
             }
             Some(json!({ "type": "broadcast_ok" }))
         }
@@ -260,5 +297,6 @@ async fn handle(node: Node, msg: Message, state: Arc<Mutex<NodeState>>) -> Optio
 #[tokio::main]
 async fn main() {
     let state = Arc::new(Mutex::new(NodeState::new()));
-    Node::run(move |node, msg| handle(node, msg, state.clone())).await;
+    let broadcast_executor = make_executor(EXECUTOR);
+    Node::run(move |node, msg| handle(node, msg, state.clone(), broadcast_executor.clone())).await;
 }
