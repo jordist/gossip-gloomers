@@ -8,8 +8,9 @@ use std::{
 use tokio::sync::Mutex;
 
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(1);
+const BATCH_INTERVAL: Duration = Duration::from_millis(100);
 const POLICY: PolicyKind = PolicyKind::Group;
-const EXECUTOR: BroadcastExecutorKind = BroadcastExecutorKind::Immediate;
+const EXECUTOR: BroadcastExecutorKind = BroadcastExecutorKind::Batched;
 const GROUP_SIZE: usize = 5; // members per group for GroupPolicy
 
 // Computes the next hops for a broadcast message based on the incoming metadata.
@@ -179,10 +180,10 @@ fn make_policy(
 
 // ---------------------------------------------------------------------------
 // Broadcast executor: decides how forwarded hops are actually put on the wire.
-// `dispatch` is called once per (dest, meta) hop. An executor may send each hop
+// `submit` is called once per (dest, meta) hop. An executor may send each hop
 // immediately or accumulate hops and flush them together later.
 trait BroadcastExecutor: Send + Sync {
-    fn dispatch(&self, node: &Node, message: Value, dest: String, meta: Value);
+    fn submit(&self, node: &Node, message: Value, dest: String, meta: Value);
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +192,7 @@ trait BroadcastExecutor: Send + Sync {
 struct ImmediateExecutor;
 
 impl BroadcastExecutor for ImmediateExecutor {
-    fn dispatch(&self, node: &Node, message: Value, dest: String, meta: Value) {
+    fn submit(&self, node: &Node, message: Value, dest: String, meta: Value) {
         let node = node.clone();
         tokio::spawn(async move {
             let body = json!({ "type": "broadcast", "message": message, "meta": meta });
@@ -201,6 +202,57 @@ impl BroadcastExecutor for ImmediateExecutor {
                 .is_none()
             {}
         });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batched executor
+struct BatchedExecutor {
+    node: Arc<std::sync::OnceLock<Node>>,
+    queues: Arc<std::sync::Mutex<HashMap<String, Vec<Value>>>>, // dest_node -> enqueued broadcasts
+}
+
+impl BatchedExecutor {
+    fn new(interval: Duration) -> Self {
+        let node: Arc<std::sync::OnceLock<Node>> = Arc::new(std::sync::OnceLock::new());
+        let queues: Arc<std::sync::Mutex<HashMap<String, Vec<Value>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let node_bg = Arc::clone(&node);
+        let queues_bg = Arc::clone(&queues);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            loop {
+                ticker.tick().await;
+                let Some(node) = node_bg.get() else { continue };
+                // Swap out the map atomically so we hold the lock as briefly as possible.
+                let snapshot = std::mem::take(&mut *queues_bg.lock().unwrap());
+                for (dest, bodies) in snapshot {
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        let rpc_body = json!({"type": "batched_broadcast", "broadcasts": bodies});
+                        while node
+                            .rpc_timeout(&dest, rpc_body.clone(), BROADCAST_TIMEOUT)
+                            .await
+                            .is_none()
+                        {}
+                    });
+                }
+            }
+        });
+        Self { node, queues }
+    }
+}
+
+impl BroadcastExecutor for BatchedExecutor {
+    fn submit(&self, node: &Node, message: Value, dest: String, meta: Value) {
+        let _ = self.node.set(node.clone()); // no-op after first call
+        let body = json!({ "type": "broadcast", "message": message, "meta": meta });
+        self.queues
+            .lock()
+            .unwrap()
+            .entry(dest)
+            .or_default()
+            .push(body);
     }
 }
 
@@ -216,7 +268,7 @@ enum BroadcastExecutorKind {
 fn make_executor(kind: BroadcastExecutorKind) -> Arc<dyn BroadcastExecutor> {
     match kind {
         BroadcastExecutorKind::Immediate => Arc::new(ImmediateExecutor),
-        BroadcastExecutorKind::Batched => todo!("batched executor"),
+        BroadcastExecutorKind::Batched => Arc::new(BatchedExecutor::new(BATCH_INTERVAL)),
     }
 }
 
@@ -236,6 +288,30 @@ impl NodeState {
     }
 }
 
+async fn handle_broadcast(
+    node: Node,
+    message: Value,
+    meta: Value,
+    state: Arc<Mutex<NodeState>>,
+    broadcast_executor: Arc<dyn BroadcastExecutor>,
+) {
+    let hops = {
+        let mut state = state.lock().await;
+        if state.seen_messages.insert(message.clone()) {
+            state
+                .policy
+                .as_ref()
+                .map(|p| p.next_hops(&meta))
+                .unwrap_or_default()
+        } else {
+            vec![]
+        }
+    };
+    for (dest, hop_meta) in hops {
+        broadcast_executor.submit(&node, message.clone(), dest, hop_meta);
+    }
+}
+
 async fn handle(
     node: Node,
     msg: Message,
@@ -247,20 +323,16 @@ async fn handle(
         "broadcast" => {
             let message = body["message"].clone();
             let meta = body["meta"].clone();
-            let hops = {
-                let mut state = state.lock().await;
-                if state.seen_messages.insert(message.clone()) {
-                    state
-                        .policy
-                        .as_ref()
-                        .map(|p| p.next_hops(&meta))
-                        .unwrap_or_default()
-                } else {
-                    vec![]
+            handle_broadcast(node, message, meta, state, broadcast_executor).await;
+            Some(json!({ "type": "broadcast_ok" }))
+        }
+        "batched_broadcast" => {
+            if let Some(arr) = body["broadcasts"].as_array() {
+                for b in arr {
+                    let message = b["message"].clone();
+                    let meta = b["meta"].clone();
+                    handle_broadcast(node.clone(), message, meta, state.clone(), broadcast_executor.clone()).await;
                 }
-            };
-            for (dest, hop_meta) in hops {
-                broadcast_executor.dispatch(&node, message.clone(), dest, hop_meta);
             }
             Some(json!({ "type": "broadcast_ok" }))
         }
