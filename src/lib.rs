@@ -35,7 +35,7 @@ impl Node {
         self.inner.node_ids.lock().await.clone()
     }
 
-    fn new() -> Self {
+    pub fn new() -> Self {
         Node {
             inner: Arc::new(NodeInner {
                 id: Mutex::new(String::new()),
@@ -166,18 +166,17 @@ impl Node {
         });
     }
 
-    pub async fn run<F, Fut>(handler: F)
+    pub async fn run<F, Fut>(&self, handler: F)
     where
         F: Fn(Node, Message) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Option<Value>> + Send + 'static,
     {
         Self::init_logger();
-        let node = Self::new();
         let handler = Arc::new(handler);
         let mut lines = BufReader::new(tokio::io::stdin()).lines();
 
         while let Ok(Some(line)) = lines.next_line().await {
-            Self::process_line(&node, line, &handler).await;
+            Self::process_line(self, line, &handler).await;
         }
     }
 }
