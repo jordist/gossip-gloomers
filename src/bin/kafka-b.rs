@@ -12,6 +12,7 @@ type Offset = u64;
 
 struct State {
     kv_store_lin: KVStore,
+    kv_store_seq: KVStore,
 }
 
 struct KVStore {
@@ -45,7 +46,7 @@ impl KVStore {
         }
     }
 
-    async fn write(&self, key: &str, val: &Value) -> Result<(), KVStoreError> {
+    async fn write(&self, key: &str, val: &Value) {
         loop {
             let mut req = json!({"type": "write", "key": key, "value": val});
             match self
@@ -54,12 +55,23 @@ impl KVStore {
                 .await
             {
                 None => continue, // timeout
-                Some(_) => return Ok(()),
+                Some(reply) => {
+                    if reply["type"] != "write_ok" {
+                        panic!()
+                    }
+                    return;
+                }
             }
         }
     }
 
-    async fn cas(&self, key: &str, expect: &Value, new: &Value, create_if_not_exists: bool) -> Result<(), KVStoreError> {
+    async fn cas(
+        &self,
+        key: &str,
+        expect: &Value,
+        new: &Value,
+        create_if_not_exists: bool,
+    ) -> Result<(), KVStoreError> {
         loop {
             let mut req = json!({"type": "cas", "key": key, "from": expect, "to": new, "create_if_not_exists": create_if_not_exists});
             match self
@@ -98,7 +110,11 @@ async fn process_send(state: &State, msg: Message) -> Offset {
         let offset = current_val.as_u64().unwrap_or(0);
         let next = offset + 1;
 
-        match state.kv_store_lin.cas(&next_offset_key, &current_val, &json!(next), true).await {
+        match state
+            .kv_store_lin
+            .cas(&next_offset_key, &current_val, &json!(next), true)
+            .await
+        {
             Ok(()) => break offset,
             Err(ExpectationMismatch) => continue,
             Err(_) => panic!(),
@@ -106,12 +122,7 @@ async fn process_send(state: &State, msg: Message) -> Offset {
     };
 
     let log_and_offset_key = format!("{log_id}_{offset}");
-    loop {
-        match state.kv_store_lin.write(&log_and_offset_key, val).await {
-            Ok(()) => break,
-            Err(_) => continue,
-        }
-    }
+    state.kv_store_seq.write(&log_and_offset_key, val).await;
     return offset;
 }
 
@@ -155,7 +166,7 @@ async fn process_poll(state: &State, msg: Message) -> Value {
     let offsets = msg.body["offsets"].as_object().unwrap();
     for (log_name, val) in offsets {
         let offset = val.as_u64().unwrap();
-        let msgs = read_log(&state.kv_store_lin, log_name, offset, MAX_ITEMS_PER_POLL).await;
+        let msgs = read_log(&state.kv_store_seq, log_name, offset, MAX_ITEMS_PER_POLL).await;
         res.insert(log_name.clone(), json!(msgs));
     }
 
@@ -168,23 +179,10 @@ async fn process_commited_offsets(state: &State, msg: Message) {
         let new_offset = val.as_u64().unwrap();
         let committed_key = format!("{log_name}_committed");
 
-        loop {
-            let current = match state.kv_store_lin.read(&committed_key).await {
-                Ok(val) => val,
-                Err(KeyNotFound) => json!(0),
-                Err(_) => panic!(),
-            };
-
-            if new_offset <= current.as_u64().unwrap() {
-                break;
-            }
-
-            match state.kv_store_lin.cas(&committed_key, &current, &json!(new_offset), true).await {
-                Ok(()) => break,
-                Err(ExpectationMismatch) => continue,
-                Err(_) => panic!(),
-            }
-        }
+        state
+            .kv_store_seq
+            .write(&committed_key, &json!(new_offset))
+            .await;
     }
 }
 
@@ -195,7 +193,7 @@ async fn process_list_commited_offsets(state: &State, msg: Message) -> Value {
     for key in keys {
         let log_name = key.as_str().unwrap();
         let committed_key = format!("{log_name}_committed");
-        let offset = match state.kv_store_lin.read(&committed_key).await {
+        let offset = match state.kv_store_seq.read(&committed_key).await {
             Ok(val) => val.as_u64().unwrap(),
             Err(KeyNotFound) => 0,
             Err(_) => panic!(),
@@ -212,6 +210,10 @@ async fn main() {
     let state = Arc::new(State {
         kv_store_lin: KVStore {
             name: "lin-kv".to_string(),
+            node: node.clone(),
+        },
+        kv_store_seq: KVStore {
+            name: "seq-kv".to_string(),
             node: node.clone(),
         },
     });
