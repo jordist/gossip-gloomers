@@ -1,11 +1,16 @@
 use flyio::{Message, Node};
+use futures::future::join_all;
 use serde_json::{json, Value};
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::KVStoreError::{ExpectationMismatch, KeyNotFound};
 
+// Improves part B by batching together the offset reservations in one single CAS request.
+// Could improve further by combining multiple log entries into a single kv store buket entry.
 const RPC_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_ITEMS_PER_POLL: u64 = 10;
+const BATCH_INTERVAL: Duration = Duration::from_millis(10);
 
 type LogId = String;
 type Offset = u64;
@@ -13,6 +18,7 @@ type Offset = u64;
 struct State {
     kv_store_lin: KVStore,
     kv_store_seq: KVStore,
+    batcher: mpsc::UnboundedSender<(LogId, oneshot::Sender<Offset>)>,
 }
 
 struct KVStore {
@@ -94,36 +100,70 @@ impl KVStore {
     }
 }
 
-async fn process_send(state: &State, msg: Message) -> Offset {
-    let log_id = msg.body["key"].as_str().unwrap().to_string();
-    let val = &msg.body["msg"];
-
+async fn reserve_offsets(kv: &KVStore, log_id: &str, count: u64) -> Offset {
     let next_offset_key = format!("{log_id}_next");
-
-    let offset = loop {
-        let current_val = match state.kv_store_lin.read(&next_offset_key).await {
+    loop {
+        let current_val = match kv.read(&next_offset_key).await {
             Ok(val) => val,
             Err(KeyNotFound) => json!(0),
             Err(_) => panic!(),
         };
 
         let offset = current_val.as_u64().unwrap_or(0);
-        let next = offset + 1;
+        let next = offset + count;
 
-        match state
-            .kv_store_lin
+        match kv
             .cas(&next_offset_key, &current_val, &json!(next), true)
             .await
         {
-            Ok(()) => break offset,
+            Ok(()) => return offset,
             Err(ExpectationMismatch) => continue,
             Err(_) => panic!(),
         }
-    };
+    }
+}
+
+async fn run_batcher(
+    state: Arc<State>,
+    mut rx: mpsc::UnboundedReceiver<(LogId, oneshot::Sender<Offset>)>,
+) {
+    loop {
+        tokio::time::sleep(BATCH_INTERVAL).await;
+
+        let mut batch: HashMap<LogId, Vec<oneshot::Sender<Offset>>> = HashMap::new();
+        while let Ok((log_id, tx)) = rx.try_recv() {
+            batch.entry(log_id).or_default().push(tx);
+        }
+
+        if batch.is_empty() {
+            continue;
+        }
+
+        let futures = batch.into_iter().map(|(log_id, senders)| {
+            let state = Arc::clone(&state);
+            async move {
+                let count = senders.len() as u64;
+                let start = reserve_offsets(&state.kv_store_lin, &log_id, count).await;
+                for (i, tx) in senders.into_iter().enumerate() {
+                    let _ = tx.send(start + i as u64);
+                }
+            }
+        });
+        join_all(futures).await;
+    }
+}
+
+async fn process_send(state: &State, msg: Message) -> Offset {
+    let log_id = msg.body["key"].as_str().unwrap().to_string();
+    let val = &msg.body["msg"];
+
+    let (tx, rx) = oneshot::channel();
+    state.batcher.send((log_id.clone(), tx)).unwrap();
+    let offset = rx.await.unwrap();
 
     let log_and_offset_key = format!("{log_id}_{offset}");
     state.kv_store_seq.write(&log_and_offset_key, val).await;
-    return offset;
+    offset
 }
 
 async fn read_log(
@@ -207,6 +247,7 @@ async fn process_list_commited_offsets(state: &State, msg: Message) -> Value {
 #[tokio::main]
 async fn main() {
     let node = Node::new();
+    let (batcher_tx, batcher_rx) = mpsc::unbounded_channel();
     let state = Arc::new(State {
         kv_store_lin: KVStore {
             name: "lin-kv".to_string(),
@@ -216,7 +257,10 @@ async fn main() {
             name: "seq-kv".to_string(),
             node: node.clone(),
         },
+        batcher: batcher_tx,
     });
+
+    tokio::spawn(run_batcher(Arc::clone(&state), batcher_rx));
 
     node.run(move |_node, msg| {
         let state = Arc::clone(&state);
