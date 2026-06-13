@@ -17,8 +17,11 @@ fn process_read(state: &State, key: Key) -> Option<Val> {
     return state.db.lock().unwrap().get(&key).copied();
 }
 
-fn process_write(state: &State, key: Key, val: Val) {
-    state.db.lock().unwrap().insert(key, val);
+fn commit_writes(state: &State, write_buffer: &[(Key, Val)]) {
+    let mut db = state.db.lock().unwrap();
+    for &(k, v) in write_buffer {
+        db.insert(k, v);
+    }
 }
 
 async fn schedule_replicate_txn(node: Node, writes: Vec<(Key, Val)>) {
@@ -48,7 +51,7 @@ async fn schedule_replicate_txn(node: Node, writes: Vec<(Key, Val)>) {
 
 async fn process_txn(state: &State, msg: &Message, node: Node) -> Value {
     let mut res: Vec<Value> = Vec::new();
-    let mut writes: Vec<(Key, Val)> = Vec::new();
+    let mut write_buffer: Vec<(Key, Val)> = Vec::new();
 
     let txn = msg.body["txn"].as_array().unwrap();
     for stmt in txn {
@@ -64,16 +67,17 @@ async fn process_txn(state: &State, msg: &Message, node: Node) -> Value {
             }
             "w" => {
                 let val = arg2.unwrap();
-                process_write(state, arg1, val);
+                write_buffer.push((arg1, val));
                 res.push(json!(["w", arg1, val]));
-                writes.push((arg1, val));
             }
             _ => {
                 panic!();
             }
         }
     }
-    schedule_replicate_txn(node, writes).await;
+
+    commit_writes(state, &write_buffer);
+    schedule_replicate_txn(node, write_buffer).await;
     serde_json::Value::Array(res)
 }
 
